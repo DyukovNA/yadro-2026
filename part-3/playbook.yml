@@ -1,0 +1,120 @@
+---
+- name: Install Docker and verify HTTP status container
+  hosts: targets
+  become: true
+  gather_facts: true
+
+  vars:
+    docker_user: "{{ ansible_user | default(ansible_env.SUDO_USER | default(ansible_user_id)) }}"
+    build_context_dir: /tmp/yadro-2026-docker-build
+    image_name: yadro-2026:part-3
+    container_name: yadro-2026-part-3
+    http_status_url_template: "https://httpbingo.org/status/{status}"
+
+  tasks:
+    - name: Check supported target OS
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "Debian"
+        fail_msg: "This playbook installs Docker with apt and supports Debian/Ubuntu targets."
+        success_msg: "Target OS is supported."
+
+    - name: Install Docker packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - docker.io
+        state: present
+        update_cache: true
+
+    - name: Add current user to docker group
+      ansible.builtin.user:
+        name: "{{ docker_user }}"
+        groups: docker
+        append: true
+
+    - name: Start and enable Docker service
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Check Docker version
+      ansible.builtin.command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Create build context directories on target
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ build_context_dir }}"
+        - "{{ build_context_dir }}/part-1"
+        - "{{ build_context_dir }}/part-2"
+
+    - name: Copy Python script to target build context
+      ansible.builtin.copy:
+        src: ../part-1/http_status_client.py
+        dest: "{{ build_context_dir }}/part-1/http_status_client.py"
+        mode: "0755"
+
+    - name: Copy Dockerfile to target build context
+      ansible.builtin.copy:
+        src: ../part-2/Dockerfile
+        dest: "{{ build_context_dir }}/part-2/Dockerfile"
+        mode: "0644"
+
+    - name: Build Docker image on target
+      ansible.builtin.command:
+        cmd: "docker build -f part-2/Dockerfile -t {{ image_name }} ."
+        chdir: "{{ build_context_dir }}"
+      register: docker_build
+      changed_when: "'Successfully built' in docker_build.stdout or 'naming to docker.io/library/' in docker_build.stdout"
+
+    - name: Remove previous verification container
+      ansible.builtin.command: "docker rm -f {{ container_name }}"
+      register: remove_container
+      failed_when: false
+      changed_when: remove_container.rc == 0
+
+    - name: Run verification container
+      ansible.builtin.command:
+        cmd: >-
+          docker run
+          --name {{ container_name }}
+          -e HTTP_STATUS_URL_TEMPLATE={{ http_status_url_template }}
+          {{ image_name }}
+      register: docker_run
+      failed_when: false
+      changed_when: true
+
+    - name: Read container logs
+      ansible.builtin.command: "docker logs {{ container_name }}"
+      register: container_logs
+      changed_when: false
+
+    - name: Read container exit code
+      ansible.builtin.command:
+        cmd: "docker inspect {{ container_name }} --format {% raw %}'{{.State.ExitCode}}'{% endraw %}"
+      register: container_exit_code
+      changed_when: false
+
+    - name: Verify script result
+      ansible.builtin.assert:
+        that:
+          - docker_run.rc == 0
+          - container_exit_code.stdout | trim == "0"
+          - "'script_completed' in container_logs.stdout"
+          - "'\"exit_code\": 0' in container_logs.stdout"
+        fail_msg: "Container verification failed. Check docker logs output above."
+        success_msg: "Container finished successfully and docker logs contain script_completed with exit_code 0."
+
+    - name: Print Docker version
+      ansible.builtin.debug:
+        msg: "{{ docker_version.stdout }}"
+
+    - name: Print container logs
+      ansible.builtin.debug:
+        msg: "{{ container_logs.stdout_lines }}"
